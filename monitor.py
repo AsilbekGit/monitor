@@ -120,45 +120,72 @@ async def login(page):
         print("[login] already authenticated.")
         return
 
-    # Step 1: reach the SSO sign-in form. The landing page has a "LOG IN TO
-    # ACCESS THE PORTAL" button that points to the login route. Rather than
-    # depend on clicking it, navigate straight to the login route, which (when
-    # not authenticated) redirects to the iam.esteri.it sign-in form. If that
-    # somehow doesn't redirect, fall back to clicking the button by text.
+    # Step 1: reach the SSO sign-in form. The landing page has a button labelled
+    # "LOG IN TO ACCESS THE PORTAL". Clicking it navigates to the sign-in form.
     if "Services" not in page.url and IAM_HOST not in page.url:
-        print("[login] on landing page; going to login route directly...")
+        print("[login] looking for the 'LOG IN TO ACCESS THE PORTAL' button...")
+
+        # Give the page a moment to fully render the button.
         try:
-            await page.goto("https://prenotami.esteri.it/UserArea",
-                            wait_until="domcontentloaded")
-            await page.wait_for_timeout(3000)
-            print("[login] after /UserArea, on:", page.url)
-        except Exception as e:
-            print("[login] /UserArea navigation issue:", e)
+            await page.wait_for_selector("a, button", timeout=10000)
+        except Exception:
+            pass
+        await page.wait_for_timeout(1500)
 
-        # If we're still on a prenotami page (not the SSO form and not logged in),
-        # try clicking the visible login button as a fallback.
-        if IAM_HOST not in page.url and "Services" not in page.url:
-            print("[login] trying to click the portal login button as fallback...")
-            # match the button/link by case-insensitive partial text
-            candidates = [
-                page.get_by_role("link", name=re.compile("log in", re.I)),
-                page.get_by_role("button", name=re.compile("log in", re.I)),
-                page.get_by_role("link", name=re.compile("accedi", re.I)),
-                page.locator("a[href*='UserArea']"),
-                page.locator("a[href*='Login']"),
-                page.locator("a[href*='signin']"),
-            ]
-            for loc in candidates:
-                try:
-                    if await loc.count() > 0:
-                        await loc.first.click()
-                        await page.wait_for_timeout(3000)
-                        print("[login] clicked a login button; now on:", page.url)
-                        break
-                except Exception:
-                    continue
+        # Try several matchers, broadest-but-still-safe included. The phrase
+        # "access the portal" is distinctive enough to not hit social links.
+        btn = None
+        finders = [
+            lambda: page.get_by_role("link",
+                     name=re.compile("access the portal", re.I)),
+            lambda: page.get_by_role("button",
+                     name=re.compile("access the portal", re.I)),
+            lambda: page.get_by_text(re.compile("access the portal", re.I)),
+            lambda: page.locator("a, button").filter(
+                     has_text=re.compile("access the portal", re.I)),
+            lambda: page.locator("a:has-text('LOG IN'), button:has-text('LOG IN')"),
+        ]
+        for finder in finders:
+            try:
+                loc = finder()
+                if await loc.count() > 0:
+                    btn = loc.first
+                    print(f"[login] found button via matcher; count={await loc.count()}")
+                    break
+            except Exception:
+                continue
 
-    # Maybe that already logged us in (session cookie) and dropped us on UserArea.
+        if btn is None:
+            # Diagnostic: print every link and button on the page so we can see
+            # what the actual text/href is, then fail clearly.
+            print("[login] BUTTON NOT FOUND. Listing all links/buttons on page:")
+            try:
+                items = page.locator("a, button")
+                n = await items.count()
+                for i in range(min(n, 40)):
+                    el = items.nth(i)
+                    txt = (await el.inner_text()).strip().replace("\n", " ")
+                    href = await el.get_attribute("href")
+                    print(f"    [{i}] text={txt!r}  href={href!r}")
+            except Exception as e:
+                print("    (could not list elements:", e, ")")
+            raise RuntimeError(
+                "Could not find the login button. See the list above in the "
+                "terminal — tell me the text/href of the right one."
+            )
+
+        print("[login] clicking the portal login button...")
+        try:
+            async with page.expect_navigation(wait_until="domcontentloaded",
+                                               timeout=30000):
+                await btn.click()
+        except Exception:
+            await page.wait_for_timeout(4000)
+
+        await page.wait_for_timeout(2000)
+        print("[login] after clicking login, on:", page.url)
+
+    # Already authenticated (session cookie) and dropped on UserArea/Services?
     if IAM_HOST not in page.url and ("UserArea" in page.url or "Services" in page.url):
         print("[login] appears already authenticated.")
         return
@@ -226,26 +253,13 @@ async def read_services(page):
     booking_status is "BOOKABLE" or the raw unavailable text.
     Walks through all pagination pages.
     """
-    print("[read] navigating to Book/Services...")
-    # The 'Book' menu item leads to /Services. Try clicking it; if not present
-    # (e.g. we're already there), just go to the URL directly.
-    book_link = page.locator("a:has-text('Book'), a:has-text('Prenota'), a[href*='Services']")
-    try:
-        if await book_link.count() > 0:
-            await book_link.first.click()
-            await page.wait_for_timeout(2000)
-        else:
-            await page.goto(SERVICES_URL, wait_until="domcontentloaded")
-            await page.wait_for_timeout(2000)
-    except Exception:
-        await page.goto(SERVICES_URL, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
+    print("[read] navigating to Services table...")
+    # The 'Book' menu item leads to /Services. Navigate directly by URL to avoid
+    # accidentally clicking the wrong link on the page.
+    await page.goto(SERVICES_URL, wait_until="domcontentloaded")
+    await page.wait_for_timeout(2000)
 
-    # Make sure we actually reached the services table.
-    if "Services" not in page.url:
-        await page.goto(SERVICES_URL, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
-
+    # If we got bounced (e.g. session expired), the caller will re-login next cycle.
     print("[read] on:", page.url)
     try:
         await page.wait_for_selector("table tbody tr", timeout=15000)
@@ -392,11 +406,22 @@ async def main():
                 try:
                     if page:
                         await page.screenshot(path="error_screenshot.png", full_page=True)
-                        print("[error] saved error_screenshot.png")
+                        print("[error] saved error_screenshot.png  (look at this file!)")
+                        print("[error] the browser was on:", page.url)
                 except Exception:
                     pass
                 notify(f"⚠️ Monitor error: {e}")
-                # re-create context if the browser died
+
+                if not HEADLESS:
+                    # Debug mode: keep the window open so you can see the stuck
+                    # page. Press Ctrl+C in the terminal to quit.
+                    print("\n[error] PAUSED for inspection. The browser window is "
+                          "kept open so you can see where it stopped.")
+                    print("[error] Look at the browser, then press Ctrl+C to quit.\n")
+                    while True:
+                        await asyncio.sleep(5)
+
+                # Headless mode: recover and keep monitoring.
                 try:
                     await context.close()
                 except Exception:
