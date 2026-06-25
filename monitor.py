@@ -132,18 +132,23 @@ async def login(page):
             pass
         await page.wait_for_timeout(1500)
 
-        # Try several matchers, broadest-but-still-safe included. The phrase
-        # "access the portal" is distinctive enough to not hit social links.
+        # The page may load in Italian OR English, so match BOTH:
+        #   EN: "LOG IN TO ACCESS THE PORTAL"
+        #   IT: "EFFETTUARE IL LOGIN PER ACCEDERE AL PORTALE"
+        # The regex below catches either language (and other portal langs that
+        # contain "portal"/"portale"), while staying clear of social links.
+        portal_re = re.compile(
+            r"(access the portal|accedere al portale|"
+            r"effettuare il login|log in to access)", re.I)
         btn = None
         finders = [
-            lambda: page.get_by_role("link",
-                     name=re.compile("access the portal", re.I)),
-            lambda: page.get_by_role("button",
-                     name=re.compile("access the portal", re.I)),
-            lambda: page.get_by_text(re.compile("access the portal", re.I)),
+            lambda: page.get_by_role("link", name=portal_re),
+            lambda: page.get_by_role("button", name=portal_re),
+            lambda: page.get_by_text(portal_re),
+            lambda: page.locator("a, button").filter(has_text=portal_re),
+            # last-resort: any link/button mentioning "portal"/"portale"
             lambda: page.locator("a, button").filter(
-                     has_text=re.compile("access the portal", re.I)),
-            lambda: page.locator("a:has-text('LOG IN'), button:has-text('LOG IN')"),
+                     has_text=re.compile(r"portal", re.I)),
         ]
         for finder in finders:
             try:
