@@ -115,83 +115,68 @@ async def login(page):
     await page.wait_for_timeout(2000)
     print("[login] landed on:", page.url)
 
-    # Already logged in (session reused)? Then we're on Services already.
-    if IAM_HOST not in page.url and "Services" in page.url:
+    # Already logged in? Only if we actually landed ON the services page.
+    # NOTE: when logged out, Prenotami sends us to
+    #   /Home?ReturnUrl=%2fServices
+    # which CONTAINS the word "Services" in the query string but is NOT the
+    # services page. So we must check the path, and treat /Home as logged-out.
+    from urllib.parse import urlparse
+    path = urlparse(page.url).path.lower()
+    on_home = path.startswith("/home")
+    on_services = path.endswith("/services")
+    if IAM_HOST not in page.url and on_services and not on_home:
         print("[login] already authenticated.")
         return
 
-    # Step 1: reach the SSO sign-in form. The landing page has a button labelled
-    # "LOG IN TO ACCESS THE PORTAL". Clicking it navigates to the sign-in form.
-    if "Services" not in page.url and IAM_HOST not in page.url:
-        print("[login] looking for the 'LOG IN TO ACCESS THE PORTAL' button...")
-
-        # Give the page a moment to fully render the button.
+    # Step 1: reach the SSO sign-in form. The landing page's login button is a
+    # plain <a> whose href is the full OAuth authorize URL on iam.esteri.it.
+    # That URL contains a fresh PKCE code_challenge each load, so we must READ
+    # the current href from the page rather than hardcode it. Navigating to the
+    # href directly is far more reliable than clicking the styled link.
+    if IAM_HOST not in page.url and not on_services:
+        print("[login] reading the login link from the landing page...")
         try:
-            await page.wait_for_selector("a, button", timeout=10000)
+            await page.wait_for_selector("a[href*='iam.esteri.it']", timeout=15000)
         except Exception:
             pass
-        await page.wait_for_timeout(1500)
 
-        # The page may load in Italian OR English, so match BOTH:
-        #   EN: "LOG IN TO ACCESS THE PORTAL"
-        #   IT: "EFFETTUARE IL LOGIN PER ACCEDERE AL PORTALE"
-        # The regex below catches either language (and other portal langs that
-        # contain "portal"/"portale"), while staying clear of social links.
-        portal_re = re.compile(
-            r"(access the portal|accedere al portale|"
-            r"effettuare il login|log in to access)", re.I)
-        btn = None
-        finders = [
-            lambda: page.get_by_role("link", name=portal_re),
-            lambda: page.get_by_role("button", name=portal_re),
-            lambda: page.get_by_text(portal_re),
-            lambda: page.locator("a, button").filter(has_text=portal_re),
-            # last-resort: any link/button mentioning "portal"/"portale"
-            lambda: page.locator("a, button").filter(
-                     has_text=re.compile(r"portal", re.I)),
-        ]
-        for finder in finders:
-            try:
-                loc = finder()
-                if await loc.count() > 0:
-                    btn = loc.first
-                    print(f"[login] found button via matcher; count={await loc.count()}")
-                    break
-            except Exception:
-                continue
+        # The login link is the <a> pointing at iam.esteri.it/login/oauth2.
+        login_href = None
+        links = page.locator("a[href*='iam.esteri.it']")
+        n = await links.count()
+        for i in range(n):
+            href = await links.nth(i).get_attribute("href")
+            if href and "oauth2/authorize" in href:
+                login_href = href
+                break
+        if login_href is None and n > 0:
+            # fall back to the first iam.esteri.it link
+            login_href = await links.first.get_attribute("href")
 
-        if btn is None:
-            # Diagnostic: print every link and button on the page so we can see
-            # what the actual text/href is, then fail clearly.
-            print("[login] BUTTON NOT FOUND. Listing all links/buttons on page:")
-            try:
-                items = page.locator("a, button")
-                n = await items.count()
-                for i in range(min(n, 40)):
-                    el = items.nth(i)
-                    txt = (await el.inner_text()).strip().replace("\n", " ")
-                    href = await el.get_attribute("href")
-                    print(f"    [{i}] text={txt!r}  href={href!r}")
-            except Exception as e:
-                print("    (could not list elements:", e, ")")
+        if not login_href:
+            print("[login] LOGIN LINK NOT FOUND. Listing iam/portal links:")
+            alllinks = page.locator("a")
+            for i in range(min(await alllinks.count(), 40)):
+                el = alllinks.nth(i)
+                txt = (await el.inner_text()).strip().replace("\n", " ")
+                href = await el.get_attribute("href")
+                if href and ("iam" in href or "portal" in (txt or "").lower()
+                             or "login" in href.lower()):
+                    print(f"    text={txt!r}  href={href!r}")
             raise RuntimeError(
-                "Could not find the login button. See the list above in the "
-                "terminal — tell me the text/href of the right one."
+                "Could not find the iam.esteri.it login link on the landing page."
             )
 
-        print("[login] clicking the portal login button...")
-        try:
-            async with page.expect_navigation(wait_until="domcontentloaded",
-                                               timeout=30000):
-                await btn.click()
-        except Exception:
-            await page.wait_for_timeout(4000)
-
-        await page.wait_for_timeout(2000)
-        print("[login] after clicking login, on:", page.url)
+        print("[login] navigating to the SSO login URL...")
+        await page.goto(login_href, wait_until="domcontentloaded")
+        await page.wait_for_timeout(2500)
+        print("[login] after login navigation, on:", page.url)
 
     # Already authenticated (session cookie) and dropped on UserArea/Services?
-    if IAM_HOST not in page.url and ("UserArea" in page.url or "Services" in page.url):
+    post_path = urlparse(page.url).path.lower()
+    if IAM_HOST not in page.url and (
+        post_path.endswith("/userarea") or post_path.endswith("/services")
+    ) and not post_path.startswith("/home"):
         print("[login] appears already authenticated.")
         return
 
@@ -259,13 +244,17 @@ async def read_services(page):
     Walks through all pagination pages.
     """
     print("[read] navigating to Services table...")
-    # The 'Book' menu item leads to /Services. Navigate directly by URL to avoid
-    # accidentally clicking the wrong link on the page.
+    # Navigate directly to /Services by URL.
     await page.goto(SERVICES_URL, wait_until="domcontentloaded")
     await page.wait_for_timeout(2000)
-
-    # If we got bounced (e.g. session expired), the caller will re-login next cycle.
     print("[read] on:", page.url)
+
+    # If we got bounced to /Home, the session isn't valid - raise so the loop
+    # re-runs login next cycle rather than silently reading 0 services.
+    from urllib.parse import urlparse
+    if urlparse(page.url).path.lower().startswith("/home"):
+        raise RuntimeError("Bounced to /Home - not logged in; will retry login.")
+
     try:
         await page.wait_for_selector("table tbody tr", timeout=15000)
     except Exception:
