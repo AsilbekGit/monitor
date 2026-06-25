@@ -41,10 +41,12 @@ SERVICES_URL = "https://prenotami.esteri.it/Services"
 # the full SSO URL.
 IAM_HOST = "iam.esteri.it"
 
-# Polling: 3 min base + up to 60s random jitter. Do NOT lower much: Prenotami
-# blocks accounts that hammer it. 60s like you asked is risky; 180s is safer.
-CHECK_EVERY = 180
-JITTER_MAX  = 60
+# Polling interval. RAISED to ~30 min because the site started showing a
+# CAPTCHA (a sign it detected too-frequent automated access). Checking every
+# 30 min ± a few min of jitter is much gentler. Do NOT lower this back down
+# while CAPTCHAs are appearing, or the account may get blocked.
+CHECK_EVERY = 30 * 60      # 30 minutes
+JITTER_MAX  = 5 * 60       # up to 5 min of random jitter (so it's not exactly on the clock)
 
 # Heartbeat: send a quiet "still watching" message every this-many seconds so
 # you know the bot is alive even when nothing has changed. Set to 0 to disable.
