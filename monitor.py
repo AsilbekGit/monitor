@@ -62,19 +62,36 @@ STATE_FILE = "last_state.json"
 # whether real dates appear. This is for services that always show a BOOK button
 # but usually say "All appointments for this service are currently booked" when
 # clicked (e.g. National D Visa). We alert only when that message is GONE.
-# Match is a case-insensitive substring of the service Description.
-# Set to None to disable deep-checking.
-DEEP_CHECK_DESCRIPTION = "national d visa"
+#
+# The page can be in English OR Italian, so we match the service Description
+# against ANY of these phrases (case-insensitive substring). The National D
+# visa row reads "National D Visa ..." in EN and "Visti Nazionali D ..." in IT.
+# Set to None / empty list to disable deep-checking.
+DEEP_CHECK_DESCRIPTIONS = [
+    "national d visa",      # English
+    "visti nazionali d",    # Italian
+]
+# Friendly name to show in Telegram messages.
+DEEP_CHECK_LABEL = "National D Visa"
 
 # The message shown when the service is clicked but has no free dates. If the
-# page shows anything OTHER than this after clicking Book, we treat it as a
-# possible opening and alert. (Multiple languages for safety.)
+# page shows anything OTHER than these after clicking Book, we treat it as a
+# possible opening and alert. (Multiple languages/wordings for safety.)
 NO_DATES_MARKERS = [
+    # English
     "all appointments for this service are currently booked",
     "currently booked",
-    "non ci sono date disponibili",       # ITA: no dates available
-    "al momento non ci sono",             # ITA
-    "tutti gli appuntamenti",             # ITA: all appointments...
+    "no availability",
+    # Italian — the real popup text seen on this portal:
+    # "Stante l'elevata richiesta i posti disponibili per il servizio
+    #  scelto sono esauriti."
+    "posti disponibili per il servizio scelto sono esauriti",
+    "sono esauriti",                      # "are sold out"
+    "elevata richiesta",                  # "high demand"
+    "non ci sono date disponibili",       # no dates available
+    "al momento non ci sono",
+    "tutti gli appuntamenti",             # all appointments...
+    "non ci sono posti",
 ]
 
 # Phrases (across the 3 site languages) that mean the row is NOT an open slot:
@@ -355,10 +372,11 @@ async def read_services(page):
     return services
 
 
-async def deep_check_service(page, description_substr):
+async def deep_check_service(page, description_substrs):
     """
-    For a specific service (matched by description substring), click its Book
-    button and determine whether real appointment dates are available.
+    For a specific service (matched if its Description contains ANY of the given
+    substrings, case-insensitive), click its Book button and determine whether
+    real appointment dates are available.
 
     Returns one of:
       "NO_DATES"  - clicked, but page says all appointments booked / no dates
@@ -370,8 +388,11 @@ async def deep_check_service(page, description_substr):
     IMPORTANT: this only READS the result. It never selects a date or confirms
     a booking. After checking it returns to the Services list.
     """
-    desc_l = description_substr.lower()
-    print(f"[deep] checking '{description_substr}' by clicking its Book button...")
+    # Accept either a single string or a list.
+    if isinstance(description_substrs, str):
+        description_substrs = [description_substrs]
+    wanted = [s.lower() for s in description_substrs]
+    print(f"[deep] checking for {description_substrs} by clicking its Book button...")
     try:
         # Make sure we're on the Services list.
         from urllib.parse import urlparse
@@ -379,7 +400,7 @@ async def deep_check_service(page, description_substr):
             await page.goto(SERVICES_URL, wait_until="domcontentloaded")
             await page.wait_for_timeout(2000)
 
-        # Find the row whose description contains our target text, then its Book
+        # Find the row whose description contains any wanted text, then its Book
         # button. Walk pages if needed.
         target_btn = None
         while target_btn is None:
@@ -390,7 +411,7 @@ async def deep_check_service(page, description_substr):
                 if await cells.count() < 4:
                     continue
                 desc = (await cells.nth(2).inner_text()).strip().lower()
-                if desc_l in desc:
+                if any(w in desc for w in wanted):
                     btns = cells.nth(3).locator("a, button")
                     for b in range(await btns.count()):
                         label = (await btns.nth(b).inner_text()).strip().lower()
@@ -537,8 +558,8 @@ async def main():
 
                 # Deep-check the target service by clicking its Book button.
                 deep_result = None
-                if DEEP_CHECK_DESCRIPTION:
-                    deep_result = await deep_check_service(page, DEEP_CHECK_DESCRIPTION)
+                if DEEP_CHECK_DESCRIPTIONS:
+                    deep_result = await deep_check_service(page, DEEP_CHECK_DESCRIPTIONS)
 
                 await page.close()
 
@@ -547,7 +568,7 @@ async def main():
                 # not every cycle, to avoid spam.
                 if deep_result == "MAYBE_OPEN" and last_deep != "MAYBE_OPEN":
                     notify(
-                        f"🚨 POSSIBLE OPENING: '{DEEP_CHECK_DESCRIPTION}'\n\n"
+                        f"🚨 POSSIBLE OPENING: {DEEP_CHECK_LABEL}\n\n"
                         f"Clicking Book no longer shows the 'all appointments "
                         f"booked' message — dates may be available RIGHT NOW.\n\n"
                         f"Go book immediately: {SERVICES_URL}")
@@ -559,11 +580,11 @@ async def main():
                 changed = False
                 # Human-readable line for the deep-checked service.
                 if deep_result == "NO_DATES":
-                    deep_line = f"🎯 {DEEP_CHECK_DESCRIPTION}: no dates yet."
+                    deep_line = f"🎯 {DEEP_CHECK_LABEL}: no dates yet."
                 elif deep_result == "MAYBE_OPEN":
-                    deep_line = f"🎯 {DEEP_CHECK_DESCRIPTION}: DATES MAY BE OPEN!"
+                    deep_line = f"🎯 {DEEP_CHECK_LABEL}: DATES MAY BE OPEN!"
                 elif deep_result == "NOT_FOUND":
-                    deep_line = f"🎯 {DEEP_CHECK_DESCRIPTION}: not found this cycle."
+                    deep_line = f"🎯 {DEEP_CHECK_LABEL}: not found this cycle."
                 else:
                     deep_line = ""
 
