@@ -120,27 +120,48 @@ async def login(page):
         print("[login] already authenticated.")
         return
 
-    # Step 1: if we're on the landing/Home page, click "LOG IN TO ACCESS THE PORTAL".
-    portal_btn_selectors = [
-        "a:has-text('LOG IN TO ACCESS THE PORTAL')",
-        "button:has-text('LOG IN TO ACCESS THE PORTAL')",
-        "a:has-text('LOG IN')", "a:has-text('Accedi')",
-        "a:has-text('ACCEDI AL PORTALE')", "a[href*='UserArea']",
-        "a[href*='Login']",
-    ]
+    # Step 1: reach the SSO sign-in form. The landing page has a "LOG IN TO
+    # ACCESS THE PORTAL" button that points to the login route. Rather than
+    # depend on clicking it, navigate straight to the login route, which (when
+    # not authenticated) redirects to the iam.esteri.it sign-in form. If that
+    # somehow doesn't redirect, fall back to clicking the button by text.
     if "Services" not in page.url and IAM_HOST not in page.url:
-        print("[login] on landing page, looking for the portal login button...")
-        for sel in portal_btn_selectors:
-            loc = page.locator(sel)
-            try:
-                if await loc.count() > 0:
-                    await loc.first.click()
-                    print(f"[login] clicked portal button via: {sel}")
-                    await page.wait_for_timeout(3000)
-                    break
-            except Exception:
-                continue
-        print("[login] after portal click, on:", page.url)
+        print("[login] on landing page; going to login route directly...")
+        try:
+            await page.goto("https://prenotami.esteri.it/UserArea",
+                            wait_until="domcontentloaded")
+            await page.wait_for_timeout(3000)
+            print("[login] after /UserArea, on:", page.url)
+        except Exception as e:
+            print("[login] /UserArea navigation issue:", e)
+
+        # If we're still on a prenotami page (not the SSO form and not logged in),
+        # try clicking the visible login button as a fallback.
+        if IAM_HOST not in page.url and "Services" not in page.url:
+            print("[login] trying to click the portal login button as fallback...")
+            # match the button/link by case-insensitive partial text
+            candidates = [
+                page.get_by_role("link", name=re.compile("log in", re.I)),
+                page.get_by_role("button", name=re.compile("log in", re.I)),
+                page.get_by_role("link", name=re.compile("accedi", re.I)),
+                page.locator("a[href*='UserArea']"),
+                page.locator("a[href*='Login']"),
+                page.locator("a[href*='signin']"),
+            ]
+            for loc in candidates:
+                try:
+                    if await loc.count() > 0:
+                        await loc.first.click()
+                        await page.wait_for_timeout(3000)
+                        print("[login] clicked a login button; now on:", page.url)
+                        break
+                except Exception:
+                    continue
+
+    # Maybe that already logged us in (session cookie) and dropped us on UserArea.
+    if IAM_HOST not in page.url and ("UserArea" in page.url or "Services" in page.url):
+        print("[login] appears already authenticated.")
+        return
 
     # Step 2: we should now be on the iam.esteri.it "Sign in" page.
     # Fields are labelled "User Name" and "Password", submit button says "Next".
