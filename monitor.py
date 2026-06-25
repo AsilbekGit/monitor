@@ -48,7 +48,9 @@ JITTER_MAX  = 60
 
 # Heartbeat: send a quiet "still watching" message every this-many seconds so
 # you know the bot is alive even when nothing has changed. Set to 0 to disable.
-HEARTBEAT_EVERY = 10 * 60   # every 10 minutes
+# (The old heartbeat is replaced by a single status message that gets edited
+# in place each cycle, so this value is no longer used.)
+HEARTBEAT_EVERY = 10 * 60
 
 # Set to False to watch the browser on screen while debugging. True = invisible.
 HEADLESS = True
@@ -71,18 +73,43 @@ NON_BOOKABLE_MARKERS = [
 # Text that confirms a live Book button.
 BOOK_BUTTON_TEXTS = ["book", "prenota", "записаться", "забронировать"]
 
+# Holds the id of the live status message so the shutdown handler can mark it
+# stopped. Also remembers the interval so we can show "next check expected by".
+STATUS = {"msg_id": None, "interval": 0}
+
 
 def notify(text: str):
-    """Send a Telegram message. Truncates to Telegram's limit."""
+    """Send a NEW Telegram message. Returns the message_id (or None)."""
     try:
-        requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage",
             data={"chat_id": TG_CHAT_ID, "text": text[:4000],
                   "disable_web_page_preview": True},
             timeout=20,
         )
+        data = r.json()
+        if data.get("ok"):
+            return data["result"]["message_id"]
     except Exception as e:
         print("Telegram send failed:", e)
+    return None
+
+
+def edit_message(message_id, text: str):
+    """Edit an existing Telegram message in place. Returns True on success."""
+    if not message_id:
+        return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TG_TOKEN}/editMessageText",
+            data={"chat_id": TG_CHAT_ID, "message_id": message_id,
+                  "text": text[:4000], "disable_web_page_preview": True},
+            timeout=20,
+        )
+        return r.json().get("ok", False)
+    except Exception as e:
+        print("Telegram edit failed:", e)
+        return False
 
 
 def looks_non_bookable(booking_cell_text: str) -> bool:
@@ -343,10 +370,23 @@ def diff_states(old: dict, new: dict):
 
 
 async def main():
-    notify("✅ Prenotami monitor started. Watching for open booking slots...")
+    import datetime
+
+    def now_str():
+        return datetime.datetime.now().strftime("%H:%M:%S")
+
+    def next_check_str():
+        # Latest time the next check should arrive (interval + max jitter + slack).
+        secs = CHECK_EVERY + JITTER_MAX + 90
+        t = datetime.datetime.now() + datetime.timedelta(seconds=secs)
+        return t.strftime("%H:%M:%S")
+
+    STATUS["interval"] = CHECK_EVERY
+
+    # One persistent status message that we EDIT each cycle (no new spam).
+    STATUS["msg_id"] = notify("🟢 Prenotami monitor is running.\nStarting first check…")
+
     last = load_state()
-    last_heartbeat = time.time()
-    cycles_since_heartbeat = 0
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS)
@@ -366,32 +406,45 @@ async def main():
                 print(f"[cycle] read {len(current)} services.")
                 await page.close()
 
+                changed = False
                 if last is None:
-                    notify(f"📋 Baseline captured: {len(current)} services tracked. "
-                           "You'll be pinged on any change.")
+                    # First baseline.
+                    bookable_now = [k for k, v in current.items() if v == "BOOKABLE"]
+                    open_line = (f"{len(bookable_now)} open now."
+                                 if bookable_now else "Nothing open right now.")
+                    edit_message(STATUS["msg_id"],
+                        f"🟢 Prenotami monitor running.\n"
+                        f"📋 Baseline: {len(current)} services tracked.\n"
+                        f"{open_line}\n"
+                        f"Last checked: {now_str()}\n"
+                        f"Next check by: {next_check_str()}")
                 else:
                     changes = diff_states(last, current)
                     bookable_now = [k for k, v in current.items() if v == "BOOKABLE"]
                     if changes:
+                        changed = True
+                        # Real change -> brand NEW message so it stands out.
                         msg = "🔔 Prenotami change detected:\n\n" + "\n".join(changes)
                         if bookable_now:
                             msg += ("\n\n➡️ Open now:\n" + "\n".join(bookable_now)
                                     + f"\n\nGo book: {SERVICES_URL}")
                         notify(msg)
+                        # Start a fresh status message below the alert so the
+                        # live status line stays at the bottom of the chat.
+                        STATUS["msg_id"] = notify("🟢 Monitoring continues…")
+
+                    # Update (edit) the persistent status line every cycle.
+                    open_line = (f"{len(bookable_now)} open now."
+                                 if bookable_now else "No changes.")
+                    edit_message(STATUS["msg_id"],
+                        f"🟢 Prenotami monitor running.\n"
+                        f"{open_line}\n"
+                        f"{len(current)} services tracked.\n"
+                        f"Last checked: {now_str()}\n"
+                        f"Next check by: {next_check_str()}")
 
                 last = current
                 save_state(current)
-                cycles_since_heartbeat += 1
-
-                # Quiet heartbeat so you know it's alive when nothing changes.
-                if HEARTBEAT_EVERY and (time.time() - last_heartbeat) >= HEARTBEAT_EVERY:
-                    bookable_now = [k for k, v in current.items() if v == "BOOKABLE"]
-                    open_line = (f"\n{len(bookable_now)} service(s) currently open."
-                                 if bookable_now else "\nNothing open right now.")
-                    notify(f"💓 Still watching. {cycles_since_heartbeat} checks since "
-                           f"last heartbeat, {len(current)} services tracked.{open_line}")
-                    last_heartbeat = time.time()
-                    cycles_since_heartbeat = 0
 
             except Exception as e:
                 import traceback
@@ -425,5 +478,35 @@ async def main():
             await asyncio.sleep(CHECK_EVERY + random.randint(0, JITTER_MAX))
 
 
+def _mark_stopped(reason="stopped"):
+    """Edit the live status message to show the bot is no longer checking."""
+    import datetime
+    t = datetime.datetime.now().strftime("%H:%M:%S")
+    edit_message(STATUS["msg_id"],
+        f"🔴 Prenotami monitor STOPPED — not checking.\n"
+        f"Reason: {reason}\n"
+        f"Stopped at: {t}\n"
+        f"(Restart the script on the Mac Studio to resume.)")
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    import signal
+
+    # Handle `kill`/termination (e.g. logout, shutdown) gracefully too.
+    def _on_term(signum, frame):
+        raise KeyboardInterrupt()
+    try:
+        signal.signal(signal.SIGTERM, _on_term)
+    except Exception:
+        pass
+
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n[shutdown] stopping, marking status as stopped in Telegram...")
+        _mark_stopped("manual stop (Ctrl+C) or terminal closed")
+    except Exception as e:
+        # Unexpected crash: mark stopped so you see it in Telegram.
+        print("[shutdown] crashed:", e)
+        _mark_stopped(f"crashed: {e}")
+        raise
