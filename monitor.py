@@ -57,6 +57,26 @@ HEADLESS = True
 
 STATE_FILE = "last_state.json"
 
+# ---------------------------------------------------------------------------
+# Deep-check a specific service by actually CLICKING its Book button and seeing
+# whether real dates appear. This is for services that always show a BOOK button
+# but usually say "All appointments for this service are currently booked" when
+# clicked (e.g. National D Visa). We alert only when that message is GONE.
+# Match is a case-insensitive substring of the service Description.
+# Set to None to disable deep-checking.
+DEEP_CHECK_DESCRIPTION = "national d visa"
+
+# The message shown when the service is clicked but has no free dates. If the
+# page shows anything OTHER than this after clicking Book, we treat it as a
+# possible opening and alert. (Multiple languages for safety.)
+NO_DATES_MARKERS = [
+    "all appointments for this service are currently booked",
+    "currently booked",
+    "non ci sono date disponibili",       # ITA: no dates available
+    "al momento non ci sono",             # ITA
+    "tutti gli appuntamenti",             # ITA: all appointments...
+]
+
 # Phrases (across the 3 site languages) that mean the row is NOT an open slot:
 #  - "not yet available"  -> calendar not open
 #  - "already made"       -> you already hold an appointment for this service
@@ -335,6 +355,115 @@ async def read_services(page):
     return services
 
 
+async def deep_check_service(page, description_substr):
+    """
+    For a specific service (matched by description substring), click its Book
+    button and determine whether real appointment dates are available.
+
+    Returns one of:
+      "NO_DATES"  - clicked, but page says all appointments booked / no dates
+      "MAYBE_OPEN"- clicked, and the 'no dates' message was NOT shown (could be
+                    a real calendar -> worth alerting)
+      "NOT_FOUND" - the service row / Book button wasn't found this cycle
+      "ERROR"     - something went wrong (treated as inconclusive, no alert)
+
+    IMPORTANT: this only READS the result. It never selects a date or confirms
+    a booking. After checking it returns to the Services list.
+    """
+    desc_l = description_substr.lower()
+    print(f"[deep] checking '{description_substr}' by clicking its Book button...")
+    try:
+        # Make sure we're on the Services list.
+        from urllib.parse import urlparse
+        if not urlparse(page.url).path.lower().endswith("/services"):
+            await page.goto(SERVICES_URL, wait_until="domcontentloaded")
+            await page.wait_for_timeout(2000)
+
+        # Find the row whose description contains our target text, then its Book
+        # button. Walk pages if needed.
+        target_btn = None
+        while target_btn is None:
+            rows = page.locator("table tbody tr")
+            count = await rows.count()
+            for i in range(count):
+                cells = rows.nth(i).locator("td")
+                if await cells.count() < 4:
+                    continue
+                desc = (await cells.nth(2).inner_text()).strip().lower()
+                if desc_l in desc:
+                    btns = cells.nth(3).locator("a, button")
+                    for b in range(await btns.count()):
+                        label = (await btns.nth(b).inner_text()).strip().lower()
+                        if any(w in label for w in BOOK_BUTTON_TEXTS):
+                            target_btn = btns.nth(b)
+                            break
+                if target_btn is not None:
+                    break
+            if target_btn is not None:
+                break
+            # next page?
+            nxt = page.locator("ul.pagination li:not(.disabled) a", has_text=">")
+            if await nxt.count() == 0:
+                nxt = page.locator("a.paginate_button.next:not(.disabled)")
+            if await nxt.count() == 0:
+                break
+            await nxt.first.click()
+            await page.wait_for_timeout(2000)
+
+        if target_btn is None:
+            print("[deep] target service/Book button not found.")
+            return "NOT_FOUND"
+
+        # Handle the JS alert/dialog that may pop up ("All appointments...").
+        dialog_text = {"msg": None}
+
+        async def on_dialog(dialog):
+            dialog_text["msg"] = dialog.message
+            await dialog.dismiss()
+
+        page.on("dialog", on_dialog)
+
+        # Click Book. This may: open a JS alert, show an in-page message, or
+        # navigate to a calendar page.
+        try:
+            await target_btn.click()
+        except Exception as e:
+            print("[deep] click issue:", e)
+        await page.wait_for_timeout(3000)
+
+        # Gather all the text we can see to judge the outcome.
+        combined = (dialog_text["msg"] or "")
+        try:
+            combined += " " + (await page.inner_text("body"))
+        except Exception:
+            pass
+        combined_l = combined.lower()
+
+        page.remove_listener("dialog", on_dialog)
+
+        # Did we get the "no dates / all booked" message?
+        no_dates = any(m in combined_l for m in NO_DATES_MARKERS)
+
+        # Return to the Services list regardless of outcome (don't stay on a
+        # calendar or leave a dialog around).
+        try:
+            await page.goto(SERVICES_URL, wait_until="domcontentloaded")
+            await page.wait_for_timeout(1500)
+        except Exception:
+            pass
+
+        if no_dates:
+            print("[deep] result: still no dates (all booked).")
+            return "NO_DATES"
+        else:
+            print("[deep] result: 'no dates' message NOT found -> possible opening!")
+            return "MAYBE_OPEN"
+
+    except Exception as e:
+        print("[deep] error:", e)
+        return "ERROR"
+
+
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE) as f:
@@ -387,6 +516,7 @@ async def main():
     STATUS["msg_id"] = notify("🟢 Prenotami monitor is running.\nStarting first check…")
 
     last = load_state()
+    last_deep = None  # previous deep-check result for the target service
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(headless=HEADLESS)
@@ -404,9 +534,39 @@ async def main():
                 await login(page)
                 current = await read_services(page)
                 print(f"[cycle] read {len(current)} services.")
+
+                # Deep-check the target service by clicking its Book button.
+                deep_result = None
+                if DEEP_CHECK_DESCRIPTION:
+                    deep_result = await deep_check_service(page, DEEP_CHECK_DESCRIPTION)
+
                 await page.close()
 
+                # Alert if the deep-checked service went from "no dates" to a
+                # possible opening (MAYBE_OPEN). We alert on entering MAYBE_OPEN,
+                # not every cycle, to avoid spam.
+                if deep_result == "MAYBE_OPEN" and last_deep != "MAYBE_OPEN":
+                    notify(
+                        f"🚨 POSSIBLE OPENING: '{DEEP_CHECK_DESCRIPTION}'\n\n"
+                        f"Clicking Book no longer shows the 'all appointments "
+                        f"booked' message — dates may be available RIGHT NOW.\n\n"
+                        f"Go book immediately: {SERVICES_URL}")
+                    # fresh status line below the alert
+                    STATUS["msg_id"] = notify("🟢 Monitoring continues…")
+                if deep_result is not None:
+                    last_deep = deep_result
+
                 changed = False
+                # Human-readable line for the deep-checked service.
+                if deep_result == "NO_DATES":
+                    deep_line = f"🎯 {DEEP_CHECK_DESCRIPTION}: no dates yet."
+                elif deep_result == "MAYBE_OPEN":
+                    deep_line = f"🎯 {DEEP_CHECK_DESCRIPTION}: DATES MAY BE OPEN!"
+                elif deep_result == "NOT_FOUND":
+                    deep_line = f"🎯 {DEEP_CHECK_DESCRIPTION}: not found this cycle."
+                else:
+                    deep_line = ""
+
                 if last is None:
                     # First baseline.
                     bookable_now = [k for k, v in current.items() if v == "BOOKABLE"]
@@ -416,7 +576,8 @@ async def main():
                         f"🟢 Prenotami monitor running.\n"
                         f"📋 Baseline: {len(current)} services tracked.\n"
                         f"{open_line}\n"
-                        f"Last checked: {now_str()}\n"
+                        + (deep_line + "\n" if deep_line else "")
+                        + f"Last checked: {now_str()}\n"
                         f"Next check by: {next_check_str()}")
                 else:
                     changes = diff_states(last, current)
@@ -440,7 +601,8 @@ async def main():
                         f"🟢 Prenotami monitor running.\n"
                         f"{open_line}\n"
                         f"{len(current)} services tracked.\n"
-                        f"Last checked: {now_str()}\n"
+                        + (deep_line + "\n" if deep_line else "")
+                        + f"Last checked: {now_str()}\n"
                         f"Next check by: {next_check_str()}")
 
                 last = current
