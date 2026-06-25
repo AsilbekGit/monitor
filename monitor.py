@@ -394,32 +394,48 @@ async def deep_check_service(page, description_substrs):
     wanted = [s.lower() for s in description_substrs]
     print(f"[deep] checking for {description_substrs} by clicking its Book button...")
     try:
-        # Make sure we're on the Services list.
-        from urllib.parse import urlparse
-        if not urlparse(page.url).path.lower().endswith("/services"):
-            await page.goto(SERVICES_URL, wait_until="domcontentloaded")
-            await page.wait_for_timeout(2000)
+        # Always reload the Services list so we start at page 1 (read_services
+        # may have left us on a later page).
+        await page.goto(SERVICES_URL, wait_until="domcontentloaded")
+        await page.wait_for_timeout(2000)
 
         # Find the row whose description contains any wanted text, then its Book
         # button. Walk pages if needed.
         target_btn = None
+        page_num = 1
         while target_btn is None:
             rows = page.locator("table tbody tr")
             count = await rows.count()
+            print(f"[deep] scanning page {page_num}: {count} rows")
             for i in range(count):
                 cells = rows.nth(i).locator("td")
                 if await cells.count() < 4:
                     continue
                 desc = (await cells.nth(2).inner_text()).strip().lower()
                 if any(w in desc for w in wanted):
-                    btns = cells.nth(3).locator("a, button")
-                    for b in range(await btns.count()):
-                        label = (await btns.nth(b).inner_text()).strip().lower()
-                        if any(w in label for w in BOOK_BUTTON_TEXTS):
-                            target_btn = btns.nth(b)
-                            break
-                if target_btn is not None:
-                    break
+                    print(f"[deep] matched row: {desc!r}")
+                    # Found the row. Grab the first clickable control in the
+                    # booking cell (the PRENOTA/BOOK button). We accept ANY
+                    # button/link here since we already matched the description.
+                    booking_cell = cells.nth(3)
+                    btns = booking_cell.locator("a, button")
+                    nb = await btns.count()
+                    print(f"[deep]   booking cell has {nb} clickable element(s)")
+                    if nb > 0:
+                        # prefer one whose text looks like a book button
+                        chosen = None
+                        for b in range(nb):
+                            label = (await btns.nth(b).inner_text()).strip().lower()
+                            print(f"[deep]   button[{b}] text={label!r}")
+                            if any(w in label for w in BOOK_BUTTON_TEXTS):
+                                chosen = btns.nth(b)
+                                break
+                        target_btn = chosen if chosen is not None else btns.first
+                        break
+                    else:
+                        print("[deep]   matched row has NO button (no slot open).")
+                        # Row exists but no button -> definitely no dates.
+                        return "NO_DATES"
             if target_btn is not None:
                 break
             # next page?
@@ -427,9 +443,11 @@ async def deep_check_service(page, description_substrs):
             if await nxt.count() == 0:
                 nxt = page.locator("a.paginate_button.next:not(.disabled)")
             if await nxt.count() == 0:
+                print("[deep] no more pages.")
                 break
             await nxt.first.click()
             await page.wait_for_timeout(2000)
+            page_num += 1
 
         if target_btn is None:
             print("[deep] target service/Book button not found.")
