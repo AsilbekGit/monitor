@@ -567,13 +567,29 @@ async def main():
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/125.0 Safari/537.36"),
         )
+
+        # ONE long-lived page + ONE login at startup. We reuse this session for
+        # every cycle and only log in again if the session has expired. Logging
+        # in fresh each cycle is what triggers the CAPTCHA, so we avoid it.
+        page = await context.new_page()
+        print("[startup] logging in once...")
+        await login(page)
+
         while True:
-            page = None
             try:
-                print("\n[cycle] starting new check...")
-                page = await context.new_page()
-                await login(page)
-                current = await read_services(page)
+                print("\n[cycle] starting new check (reusing session)...")
+                # Go straight to Services using the existing session. If the
+                # session expired, read_services raises 'Bounced to /Home', and
+                # we log in again just that once.
+                try:
+                    current = await read_services(page)
+                except Exception as e:
+                    if "Bounced to /Home" in str(e) or "not logged in" in str(e):
+                        print("[cycle] session expired -> logging in again...")
+                        await login(page)
+                        current = await read_services(page)
+                    else:
+                        raise
                 print(f"[cycle] read {len(current)} services.")
 
                 # Deep-check the target service by clicking its Book button.
@@ -581,7 +597,7 @@ async def main():
                 if DEEP_CHECK_DESCRIPTIONS:
                     deep_result = await deep_check_service(page, DEEP_CHECK_DESCRIPTIONS)
 
-                await page.close()
+                # (Page is kept alive and reused next cycle - do NOT close it.)
 
                 # Alert if the deep-checked service went from "no dates" to a
                 # possible opening (MAYBE_OPEN). We alert on entering MAYBE_OPEN,
@@ -671,12 +687,24 @@ async def main():
                     while True:
                         await asyncio.sleep(5)
 
-                # Headless mode: recover and keep monitoring.
+                # Headless mode: recover. Recreate the context+page and log in
+                # again (a hard error usually means the session/page is broken).
                 try:
                     await context.close()
                 except Exception:
                     pass
-                context = await browser.new_context()
+                context = await browser.new_context(
+                    locale="en-US",
+                    user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                "Chrome/125.0 Safari/537.36"),
+                )
+                page = await context.new_page()
+                try:
+                    print("[recover] logging in again after error...")
+                    await login(page)
+                except Exception as le:
+                    print("[recover] re-login failed:", le)
 
             await asyncio.sleep(CHECK_EVERY + random.randint(0, JITTER_MAX))
 
