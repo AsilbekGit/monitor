@@ -117,6 +117,22 @@ BOOK_BUTTON_TEXTS = ["book", "prenota", "записаться", "заброни�
 STATUS = {"msg_id": None, "interval": 0}
 
 
+async def goto_retry(page, url, attempts=3, wait_until="domcontentloaded"):
+    """Navigate to a URL, retrying a few times if it times out / errors.
+    A single slow page load shouldn't kill the whole cycle."""
+    last_err = None
+    for i in range(attempts):
+        try:
+            await page.goto(url, wait_until=wait_until)
+            return True
+        except Exception as e:
+            last_err = e
+            print(f"[nav] goto attempt {i+1}/{attempts} failed: {e}")
+            await page.wait_for_timeout(5000)  # brief pause, then retry
+    # All attempts failed.
+    raise last_err
+
+
 def notify(text: str):
     """Send a NEW Telegram message. Returns the message_id (or None)."""
     try:
@@ -177,8 +193,8 @@ async def login(page):
     # first to a landing page (/Home) with a "LOG IN TO ACCESS THE PORTAL"
     # button, and only after clicking that do we reach the iam.esteri.it form.
     print("[login] going to Services page...")
-    await page.goto(SERVICES_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(2000)
+    await goto_retry(page, SERVICES_URL)
+    await page.wait_for_timeout(4000)
     print("[login] landed on:", page.url)
 
     # Already logged in? Only if we actually landed ON the services page.
@@ -202,7 +218,7 @@ async def login(page):
     if IAM_HOST not in page.url and not on_services:
         print("[login] reading the login link from the landing page...")
         try:
-            await page.wait_for_selector("a[href*='iam.esteri.it']", timeout=15000)
+            await page.wait_for_selector("a[href*='iam.esteri.it']", timeout=30000)
         except Exception:
             pass
 
@@ -234,8 +250,8 @@ async def login(page):
             )
 
         print("[login] navigating to the SSO login URL...")
-        await page.goto(login_href, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2500)
+        await goto_retry(page, login_href)
+        await page.wait_for_timeout(4000)
         print("[login] after login navigation, on:", page.url)
 
     # Already authenticated (session cookie) and dropped on UserArea/Services?
@@ -266,9 +282,52 @@ async def login(page):
     # The SSO form may load its inputs a moment after the page; wait for one.
     print("[login] waiting for password field...")
     try:
-        await page.wait_for_selector("input[type='password']", timeout=20000)
+        await page.wait_for_selector("input[type='password']", timeout=30000)
     except Exception:
         print("[login] WARNING: password field never appeared.")
+
+    # Detect a CAPTCHA / non-standard login page. If the username & password
+    # inputs aren't both present, it's very likely a CAPTCHA challenge or an
+    # interstitial - which the bot CANNOT solve. Report it clearly and save a
+    # screenshot, rather than failing with a confusing "field not found".
+    has_user = False
+    for sel in username_selectors:
+        try:
+            if await page.locator(sel).count() > 0:
+                has_user = True
+                break
+        except Exception:
+            pass
+    has_pass = False
+    for sel in pass_selectors:
+        try:
+            if await page.locator(sel).count() > 0:
+                has_pass = True
+                break
+        except Exception:
+            pass
+
+    if not (has_user and has_pass):
+        # Look for tell-tale CAPTCHA markers for a more precise message.
+        body = ""
+        try:
+            body = (await page.inner_text("body")).lower()
+        except Exception:
+            pass
+        captcha_words = ["captcha", "recaptcha", "not a robot",
+                         "verifica", "sono un robot", "i'm not a robot"]
+        looks_captcha = any(w in body for w in captcha_words)
+        try:
+            await page.screenshot(path="login_blocked.png", full_page=True)
+        except Exception:
+            pass
+        raise RuntimeError(
+            ("CAPTCHA on login page — cannot log in automatically."
+             if looks_captcha else
+             "Login form not present (possible CAPTCHA/interstitial).")
+            + " The existing session keeps running; will retry next cycle. "
+              "Screenshot saved as login_blocked.png."
+        )
 
     print("[login] filling credentials...")
     await _fill_first(page, username_selectors, USERNAME, "User Name")
@@ -288,9 +347,9 @@ async def login(page):
     # After Next, the IdP redirects back through OAuth to prenotami Services.
     print("[login] waiting for redirect back to Services...")
     try:
-        await page.wait_for_url("**/Services**", timeout=30000)
+        await page.wait_for_url("**/Services**", timeout=60000)
     except Exception:
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(5000)
     print("[login] now on:", page.url)
 
     # If we're still on the identity provider, login didn't complete.
@@ -311,8 +370,8 @@ async def read_services(page):
     """
     print("[read] navigating to Services table...")
     # Navigate directly to /Services by URL.
-    await page.goto(SERVICES_URL, wait_until="domcontentloaded")
-    await page.wait_for_timeout(2000)
+    await goto_retry(page, SERVICES_URL)
+    await page.wait_for_timeout(4000)
     print("[read] on:", page.url)
 
     # If we got bounced to /Home, the session isn't valid - raise so the loop
@@ -322,7 +381,7 @@ async def read_services(page):
         raise RuntimeError("Bounced to /Home - not logged in; will retry login.")
 
     try:
-        await page.wait_for_selector("table tbody tr", timeout=15000)
+        await page.wait_for_selector("table tbody tr", timeout=30000)
     except Exception:
         print("[read] WARNING: services table not found.")
     services = {}
@@ -369,7 +428,7 @@ async def read_services(page):
         if await nxt.count() == 0:
             break
         await nxt.first.click()
-        await page.wait_for_timeout(2000)
+        await page.wait_for_timeout(4000)
 
     return services
 
@@ -396,10 +455,15 @@ async def deep_check_service(page, description_substrs):
     wanted = [s.lower() for s in description_substrs]
     print(f"[deep] checking for {description_substrs} by clicking its Book button...")
     try:
-        # Always reload the Services list so we start at page 1 (read_services
-        # may have left us on a later page).
-        await page.goto(SERVICES_URL, wait_until="domcontentloaded")
-        await page.wait_for_timeout(2000)
+        # Always reload the Services list so we start at page 1.
+        await goto_retry(page, SERVICES_URL)
+        await page.wait_for_timeout(4000)
+
+        # If bounced to /Home, the session expired; signal the caller to log in.
+        from urllib.parse import urlparse
+        if urlparse(page.url).path.lower().startswith("/home"):
+            print("[deep] bounced to /Home - session expired.")
+            return "LOGGED_OUT"
 
         # Find the row whose description contains any wanted text, then its Book
         # button. Walk pages if needed.
@@ -448,7 +512,7 @@ async def deep_check_service(page, description_substrs):
                 print("[deep] no more pages.")
                 break
             await nxt.first.click()
-            await page.wait_for_timeout(2000)
+            await page.wait_for_timeout(4000)
             page_num += 1
 
         if target_btn is None:
@@ -470,7 +534,7 @@ async def deep_check_service(page, description_substrs):
             await target_btn.click()
         except Exception as e:
             print("[deep] click issue:", e)
-        await page.wait_for_timeout(3000)
+        await page.wait_for_timeout(5000)
 
         # Gather all the text we can see to judge the outcome.
         combined = (dialog_text["msg"] or "")
@@ -488,8 +552,8 @@ async def deep_check_service(page, description_substrs):
         # Return to the Services list regardless of outcome (don't stay on a
         # calendar or leave a dialog around).
         try:
-            await page.goto(SERVICES_URL, wait_until="domcontentloaded")
-            await page.wait_for_timeout(1500)
+            await goto_retry(page, SERVICES_URL)
+            await page.wait_for_timeout(5000)
         except Exception:
             pass
 
@@ -556,7 +620,6 @@ async def main():
     # One persistent status message that we EDIT each cycle (no new spam).
     STATUS["msg_id"] = notify("🟢 Prenotami monitor is running.\nStarting first check…")
 
-    last = load_state()
     last_deep = None  # previous deep-check result for the target service
 
     async with async_playwright() as p:
@@ -567,6 +630,9 @@ async def main():
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/125.0 Safari/537.36"),
         )
+        # Generous default timeouts so slow page loads don't error out.
+        context.set_default_navigation_timeout(90000)  # 90s for goto/navigation
+        context.set_default_timeout(45000)             # 45s for waits/clicks
 
         # ONE long-lived page + ONE login at startup. We reuse this session for
         # every cycle and only log in again if the session has expired. Logging
@@ -577,44 +643,29 @@ async def main():
 
         while True:
             try:
-                print("\n[cycle] starting new check (reusing session)...")
-                # Go straight to Services using the existing session. If the
-                # session expired, read_services raises 'Bounced to /Home', and
-                # we log in again just that once.
-                try:
-                    current = await read_services(page)
-                except Exception as e:
-                    if "Bounced to /Home" in str(e) or "not logged in" in str(e):
-                        print("[cycle] session expired -> logging in again...")
-                        await login(page)
-                        current = await read_services(page)
-                    else:
-                        raise
-                print(f"[cycle] read {len(current)} services.")
+                print("\n[cycle] starting check (National D Visa only)...")
 
-                # Deep-check the target service by clicking its Book button.
-                deep_result = None
-                if DEEP_CHECK_DESCRIPTIONS:
+                # Deep-check ONLY the target service. It navigates to Services
+                # itself. If the session expired it returns "LOGGED_OUT" so we
+                # log in once and retry.
+                deep_result = await deep_check_service(page, DEEP_CHECK_DESCRIPTIONS)
+                if deep_result == "LOGGED_OUT":
+                    print("[cycle] session expired -> logging in again...")
+                    await login(page)
                     deep_result = await deep_check_service(page, DEEP_CHECK_DESCRIPTIONS)
 
-                # (Page is kept alive and reused next cycle - do NOT close it.)
-
-                # Alert if the deep-checked service went from "no dates" to a
-                # possible opening (MAYBE_OPEN). We alert on entering MAYBE_OPEN,
-                # not every cycle, to avoid spam.
+                # Alert only on the transition into a possible opening.
                 if deep_result == "MAYBE_OPEN" and last_deep != "MAYBE_OPEN":
                     notify(
                         f"🚨 POSSIBLE OPENING: {DEEP_CHECK_LABEL}\n\n"
                         f"Clicking Book no longer shows the 'all appointments "
                         f"booked' message — dates may be available RIGHT NOW.\n\n"
                         f"Go book immediately: {SERVICES_URL}")
-                    # fresh status line below the alert
                     STATUS["msg_id"] = notify("🟢 Monitoring continues…")
                 if deep_result is not None:
                     last_deep = deep_result
 
-                changed = False
-                # Human-readable line for the deep-checked service.
+                # Status line for the single tracked service.
                 if deep_result == "NO_DATES":
                     deep_line = f"🎯 {DEEP_CHECK_LABEL}: no dates yet."
                 elif deep_result == "MAYBE_OPEN":
@@ -622,48 +673,15 @@ async def main():
                 elif deep_result == "NOT_FOUND":
                     deep_line = f"🎯 {DEEP_CHECK_LABEL}: not found this cycle."
                 else:
-                    deep_line = ""
+                    deep_line = f"🎯 {DEEP_CHECK_LABEL}: check inconclusive."
 
-                if last is None:
-                    # First baseline.
-                    bookable_now = [k for k, v in current.items() if v == "BOOKABLE"]
-                    open_line = (f"{len(bookable_now)} open now."
-                                 if bookable_now else "Nothing open right now.")
-                    edit_message(STATUS["msg_id"],
-                        f"🟢 Prenotami monitor running.\n"
-                        f"📋 Baseline: {len(current)} services tracked.\n"
-                        f"{open_line}\n"
-                        + (deep_line + "\n" if deep_line else "")
-                        + f"Last checked: {now_str()}\n"
-                        f"Next check by: {next_check_str()}")
-                else:
-                    changes = diff_states(last, current)
-                    bookable_now = [k for k, v in current.items() if v == "BOOKABLE"]
-                    if changes:
-                        changed = True
-                        # Real change -> brand NEW message so it stands out.
-                        msg = "🔔 Prenotami change detected:\n\n" + "\n".join(changes)
-                        if bookable_now:
-                            msg += ("\n\n➡️ Open now:\n" + "\n".join(bookable_now)
-                                    + f"\n\nGo book: {SERVICES_URL}")
-                        notify(msg)
-                        # Start a fresh status message below the alert so the
-                        # live status line stays at the bottom of the chat.
-                        STATUS["msg_id"] = notify("🟢 Monitoring continues…")
-
-                    # Update (edit) the persistent status line every cycle.
-                    open_line = (f"{len(bookable_now)} open now."
-                                 if bookable_now else "No changes.")
-                    edit_message(STATUS["msg_id"],
-                        f"🟢 Prenotami monitor running.\n"
-                        f"{open_line}\n"
-                        f"{len(current)} services tracked.\n"
-                        + (deep_line + "\n" if deep_line else "")
-                        + f"Last checked: {now_str()}\n"
-                        f"Next check by: {next_check_str()}")
-
-                last = current
-                save_state(current)
+                # Update (edit) the persistent status line every cycle.
+                edit_message(STATUS["msg_id"],
+                    f"🟢 Prenotami monitor running.\n"
+                    f"Watching: {DEEP_CHECK_LABEL} only.\n"
+                    f"{deep_line}\n"
+                    f"Last checked: {now_str()}\n"
+                    f"Next check by: {next_check_str()}")
 
             except Exception as e:
                 import traceback
@@ -699,6 +717,8 @@ async def main():
                                 "AppleWebKit/537.36 (KHTML, like Gecko) "
                                 "Chrome/125.0 Safari/537.36"),
                 )
+                context.set_default_navigation_timeout(90000)
+                context.set_default_timeout(45000)
                 page = await context.new_page()
                 try:
                     print("[recover] logging in again after error...")
