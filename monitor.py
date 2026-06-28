@@ -48,6 +48,14 @@ IAM_HOST = "iam.esteri.it"
 CHECK_EVERY = 30 * 60      # 30 minutes
 JITTER_MAX  = 5 * 60       # up to 5 min of random jitter (so it's not exactly on the clock)
 
+# Once every this-many seconds, fully tear down the browser and log in fresh.
+# A daily clean restart clears stale sessions/state that can lead to blocking.
+DAILY_RESTART_EVERY = 24 * 3600   # 24 hours
+
+# If this many cycles in a row fail with errors, force a full browser restart
+# (fresh context + login) to try to recover automatically.
+MAX_CONSEC_ERRORS = 3
+
 # Heartbeat: send a quiet "still watching" message every this-many seconds so
 # you know the bot is alive even when nothing has changed. Set to 0 to disable.
 # (The old heartbeat is replaced by a single status message that gets edited
@@ -622,7 +630,8 @@ async def main():
 
     last_deep = None  # previous deep-check result for the target service
 
-    async with async_playwright() as p:
+    async def make_browser_and_login(p):
+        """Launch a fresh browser, context, page, and log in. Returns them."""
         browser = await p.chromium.launch(headless=HEADLESS)
         context = await browser.new_context(
             locale="en-US",
@@ -630,19 +639,33 @@ async def main():
                         "AppleWebKit/537.36 (KHTML, like Gecko) "
                         "Chrome/125.0 Safari/537.36"),
         )
-        # Generous default timeouts so slow page loads don't error out.
-        context.set_default_navigation_timeout(90000)  # 90s for goto/navigation
-        context.set_default_timeout(45000)             # 45s for waits/clicks
-
-        # ONE long-lived page + ONE login at startup. We reuse this session for
-        # every cycle and only log in again if the session has expired. Logging
-        # in fresh each cycle is what triggers the CAPTCHA, so we avoid it.
+        context.set_default_navigation_timeout(90000)
+        context.set_default_timeout(45000)
         page = await context.new_page()
-        print("[startup] logging in once...")
+        print("[startup] logging in...")
         await login(page)
+        return browser, context, page
+
+    async with async_playwright() as p:
+        browser, context, page = await make_browser_and_login(p)
+        session_started = time.time()   # when this browser session began
+        consec_errors = 0               # consecutive failed cycles
 
         while True:
             try:
+                # --- Scheduled daily restart: fresh browser + login ---
+                if time.time() - session_started >= DAILY_RESTART_EVERY:
+                    print("[daily] 24h elapsed -> full restart (fresh login)...")
+                    notify("♻️ Daily restart: refreshing session and logging in again.")
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+                    browser, context, page = await make_browser_and_login(p)
+                    session_started = time.time()
+                    consec_errors = 0
+                    STATUS["msg_id"] = notify("🟢 Monitoring resumed after daily restart.")
+
                 print("\n[cycle] starting check (National D Visa only)...")
 
                 # Deep-check ONLY the target service. It navigates to Services
@@ -683,48 +706,68 @@ async def main():
                     f"Last checked: {now_str()}\n"
                     f"Next check by: {next_check_str()}")
 
+                consec_errors = 0  # this cycle succeeded
+
             except Exception as e:
                 import traceback
                 traceback.print_exc()
-                # Save a screenshot of where it got stuck, for diagnosis.
+                consec_errors += 1
                 try:
                     if page:
                         await page.screenshot(path="error_screenshot.png", full_page=True)
-                        print("[error] saved error_screenshot.png  (look at this file!)")
+                        print("[error] saved error_screenshot.png")
                         print("[error] the browser was on:", page.url)
                 except Exception:
                     pass
-                notify(f"⚠️ Monitor error: {e}")
+                notify(f"⚠️ Monitor error ({consec_errors}/{MAX_CONSEC_ERRORS}): {e}")
 
                 if not HEADLESS:
-                    # Debug mode: keep the window open so you can see the stuck
-                    # page. Press Ctrl+C in the terminal to quit.
-                    print("\n[error] PAUSED for inspection. The browser window is "
-                          "kept open so you can see where it stopped.")
-                    print("[error] Look at the browser, then press Ctrl+C to quit.\n")
+                    # Debug mode: keep the window open so you can see the stuck page.
+                    print("\n[error] PAUSED for inspection. Ctrl+C to quit.\n")
                     while True:
                         await asyncio.sleep(5)
 
-                # Headless mode: recover. Recreate the context+page and log in
-                # again (a hard error usually means the session/page is broken).
-                try:
-                    await context.close()
-                except Exception:
-                    pass
-                context = await browser.new_context(
-                    locale="en-US",
-                    user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                                "Chrome/125.0 Safari/537.36"),
-                )
-                context.set_default_navigation_timeout(90000)
-                context.set_default_timeout(45000)
-                page = await context.new_page()
-                try:
-                    print("[recover] logging in again after error...")
-                    await login(page)
-                except Exception as le:
-                    print("[recover] re-login failed:", le)
+                # Recover. If errors are piling up, do a FULL browser restart
+                # (fresh process-like state). Otherwise just rebuild the page.
+                if consec_errors >= MAX_CONSEC_ERRORS:
+                    print("[recover] too many errors -> FULL browser restart...")
+                    notify("♻️ Repeated errors — doing a full restart with fresh login.")
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+                    try:
+                        await browser.close()
+                    except Exception:
+                        pass
+                    try:
+                        browser, context, page = await make_browser_and_login(p)
+                        session_started = time.time()
+                        consec_errors = 0
+                        STATUS["msg_id"] = notify("🟢 Recovered via full restart.")
+                    except Exception as le:
+                        print("[recover] full restart failed:", le)
+                        notify(f"⚠️ Full restart failed: {le}. Will keep retrying.")
+                else:
+                    # Lighter recovery: new context + page + login.
+                    try:
+                        await context.close()
+                    except Exception:
+                        pass
+                    try:
+                        context = await browser.new_context(
+                            locale="en-US",
+                            user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                                        "Chrome/125.0 Safari/537.36"),
+                        )
+                        context.set_default_navigation_timeout(90000)
+                        context.set_default_timeout(45000)
+                        page = await context.new_page()
+                        print("[recover] logging in again after error...")
+                        await login(page)
+                    except Exception as le:
+                        print("[recover] re-login failed:", le)
 
             await asyncio.sleep(CHECK_EVERY + random.randint(0, JITTER_MAX))
 
